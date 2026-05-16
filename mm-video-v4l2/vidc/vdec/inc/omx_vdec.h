@@ -1007,7 +1007,6 @@ class omx_vdec: public qc_omx_component
 #ifdef USE_ION
         bool alloc_map_ion_memory(OMX_U32 buffer_size, vdec_ion *ion_info, int flag);
         void free_ion_memory(struct vdec_ion *buf_ion_info);
-        void do_cache_operations(int fd);
 #endif
 
 #ifdef USE_GBM
@@ -1198,7 +1197,6 @@ class omx_vdec: public qc_omx_component
         bool rst_prev_ts;
         OMX_U32 frm_int;
         OMX_U32 m_fps_received;
-        float   m_fps_prev;
         bool m_drc_enable;
 
         struct vdec_allocatorproperty op_buf_rcnfg;
@@ -1368,7 +1366,8 @@ class omx_vdec: public qc_omx_component
         int log_output_buffers(OMX_BUFFERHEADERTYPE *);
         int log_cc_output_buffers(OMX_BUFFERHEADERTYPE *);
         void send_codec_config();
-        OMX_TICKS m_last_rendered_TS;
+        OMX_TICKS m_prev_timestampUs;
+        bool m_prev_frame_rendered;
         int32_t m_dec_hfr_fps;
         int32_t m_dec_secure_prefetch_size_internal;
         int32_t m_dec_secure_prefetch_size_output;
