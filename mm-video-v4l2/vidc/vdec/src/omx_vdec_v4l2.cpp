@@ -737,7 +737,6 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     rst_prev_ts(true),
     frm_int(0),
     m_fps_received(0),
-    m_fps_prev(0),
     m_drc_enable(0),
     in_reconfig(false),
     c2d_enable_pending(false),
@@ -753,7 +752,8 @@ omx_vdec::omx_vdec(): m_error_propogated(false),
     allocate_native_handle(false),
     client_set_fps(false),
     stereo_output_mode(HAL_NO_3D),
-    m_last_rendered_TS(-1),
+    m_prev_timestampUs(0),
+    m_prev_frame_rendered(false),
     m_dec_hfr_fps(0),
     m_dec_secure_prefetch_size_internal(0),
     m_dec_secure_prefetch_size_output(0),
@@ -2040,11 +2040,7 @@ int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_
     if (!m_debug.in_buffer_log)
         return 0;
 
-#ifdef USE_ION
-    do_cache_operations(fd);
-#else
-    (void)fd;
-#endif
+    sync_start_read(fd);
     if (m_debug.in_buffer_log && !m_debug.infile) {
         if(!strncmp(drv_ctx.kind,"OMX.qcom.video.decoder.mpeg2", OMX_MAX_STRINGNAME_SIZE)) {
                 snprintf(m_debug.infile_name, OMX_MAX_STRINGNAME_SIZE, "%s/input_dec_%d_%d_%p_%" PRId64 ".mpg", m_debug.log_loc,
@@ -2071,9 +2067,7 @@ int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_
             DEBUG_PRINT_HIGH("Failed to open input file: %s for logging (%d:%s)",
                              m_debug.infile_name, errno, strerror(errno));
             m_debug.infile_name[0] = '\0';
-#ifdef USE_ION
-            do_cache_operations(fd);
-#endif
+            sync_end_read(fd);
             return -1;
         }
         if (!strncmp(drv_ctx.kind, "OMX.qcom.video.decoder.vp8", OMX_MAX_STRINGNAME_SIZE) ||
@@ -2095,17 +2089,20 @@ int omx_vdec::log_input_buffers(const char *buffer_addr, int buffer_len, uint64_
         }
         fwrite(buffer_addr, buffer_len, 1, m_debug.infile);
     }
-#ifdef USE_ION
-    do_cache_operations(fd);
-#endif
+    sync_end_read(fd);
     return 0;
 }
 
 int omx_vdec::log_cc_output_buffers(OMX_BUFFERHEADERTYPE *buffer) {
+    vdec_bufferpayload *vdec_buf = NULL;
+    int index = 0;
     if (client_buffers.client_buffers_invalid() ||
         !m_debug.out_cc_buffer_log || !buffer || !buffer->nFilledLen)
         return 0;
 
+    index = buffer - m_out_mem_ptr;
+    vdec_buf = &drv_ctx.ptr_outputbuffer[index];
+    sync_start_read(vdec_buf->pmem_fd);
     if (m_debug.out_cc_buffer_log && !m_debug.ccoutfile) {
         snprintf(m_debug.ccoutfile_name, OMX_MAX_STRINGNAME_SIZE, "%s/output_cc_%d_%d_%p_%" PRId64 "_%d.yuv",
                 m_debug.log_loc, drv_ctx.video_resolution.frame_width, drv_ctx.video_resolution.frame_height, this,
@@ -2120,6 +2117,7 @@ int omx_vdec::log_cc_output_buffers(OMX_BUFFERHEADERTYPE *buffer) {
     }
 
     fwrite(buffer->pBuffer, buffer->nFilledLen, 1, m_debug.ccoutfile);
+    sync_end_read(vdec_buf->pmem_fd);
     return 0;
 }
 
@@ -3141,15 +3139,24 @@ OMX_ERRORTYPE  omx_vdec::send_command_proxy(OMX_IN OMX_HANDLETYPE hComp,
                     param1 == OMX_ALL)) {
             if (android_atomic_add(0, &m_queued_codec_config_count) > 0) {
                struct timespec ts;
-
-               clock_gettime(CLOCK_REALTIME, &ts);
-               ts.tv_sec += 1;
-               DEBUG_PRINT_LOW("waiting for %d EBDs of CODEC CONFIG buffers ",
+                int rc = 0;
+#ifdef __BIONIC__
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+#elif __GLIBC__
+                clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+                ts.tv_sec += 1;
+                DEBUG_PRINT_LOW("waiting for %d EBDs of CODEC CONFIG buffers ",
                        m_queued_codec_config_count);
                BITMASK_SET(&m_flags, OMX_COMPONENT_FLUSH_DEFERRED);
-               if (sem_timedwait(&m_safe_flush, &ts)) {
-                   DEBUG_PRINT_ERROR("Failed to wait for EBDs of CODEC CONFIG buffers");
-               }
+#ifdef __BIONIC__
+                rc = sem_timedwait_monotonic_np(&m_safe_flush, &ts);
+#elif __GLIBC__
+                rc = sem_timedwait(&m_safe_flush, &ts);
+#endif
+                if (rc) {
+                    DEBUG_PRINT_ERROR("Failed to wait for EBDs of CODEC CONFIG buffers");
+                }
                BITMASK_CLEAR (&m_flags,OMX_COMPONENT_FLUSH_DEFERRED);
             }
         }
@@ -3340,10 +3347,7 @@ bool omx_vdec::execute_output_flush()
     pthread_mutex_lock(&m_lock);
     DEBUG_PRINT_LOW("Initiate Output Flush");
 
-    //reset last render TS
-    if(m_last_rendered_TS > 0) {
-        m_last_rendered_TS = 0;
-    }
+    m_prev_timestampUs = 0;
 
     while (m_ftb_q.m_size) {
         m_ftb_q.pop_entry(&p1,&p2,&ident);
@@ -5283,9 +5287,6 @@ OMX_ERRORTYPE  omx_vdec::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
             DEBUG_PRINT_LOW("set_parameter: decoder output-frame-rate %d", pParam->fps);
             m_dec_hfr_fps=pParam->fps;
             DEBUG_PRINT_HIGH("output-frame-rate value = %d", m_dec_hfr_fps);
-            if (m_dec_hfr_fps) {
-                m_last_rendered_TS = 0;
-            }
             break;
         }
         default: {
@@ -5806,7 +5807,7 @@ OMX_ERRORTYPE  omx_vdec::component_tunnel_request(OMX_IN OMX_HANDLETYPE  hComp,
 
    DESCRIPTION
    Map the memory and run the ioctl SYNC operations
-   on ION fd with DMA_BUF_IOCTL_SYNC
+   on ION fd
 
    PARAMETERS
    fd    : ION fd
@@ -5820,11 +5821,8 @@ char *omx_vdec::ion_map(int fd, int len)
 {
     char *bufaddr = (char*)mmap(NULL, len, PROT_READ|PROT_WRITE,
                                 MAP_SHARED, fd, 0);
-    if (bufaddr != MAP_FAILED) {
-#ifdef USE_ION
-    do_cache_operations(fd);
-#endif
-    }
+    if (bufaddr != MAP_FAILED)
+        cache_clean_invalidate(fd);
     return bufaddr;
 }
 
@@ -5846,11 +5844,7 @@ char *omx_vdec::ion_map(int fd, int len)
    ========================================================================== */
 OMX_ERRORTYPE omx_vdec::ion_unmap(int fd, void *bufaddr, int len)
 {
-#ifdef USE_ION
-    do_cache_operations(fd);
-#else
-    (void)fd;
-#endif
+    cache_clean_invalidate(fd);
     if (-1 == munmap(bufaddr, len)) {
         DEBUG_PRINT_ERROR("munmap failed.");
         return OMX_ErrorInsufficientResources;
@@ -8677,67 +8671,50 @@ OMX_ERRORTYPE omx_vdec::fill_buffer_done(OMX_HANDLETYPE hComp,
         il_buffer = client_buffers.get_il_buf_hdr(buffer);
         OMX_U32 current_framerate = (int)(drv_ctx.frame_rate.fps_numerator / drv_ctx.frame_rate.fps_denominator);
 
-        if (il_buffer && m_last_rendered_TS >= 0) {
-            OMX_TICKS ts_delta = (OMX_TICKS)llabs(il_buffer->nTimeStamp - m_last_rendered_TS);
-            // Convert fps into ms value. 1 sec = 1000000 ms.
-            OMX_U64 target_ts_delta = m_dec_hfr_fps ? 1000000 / m_dec_hfr_fps : ts_delta;
+        if (il_buffer && il_buffer->nTimeStamp >= 0 && m_dec_hfr_fps > 0 && buffer->nFilledLen > 0) {
+            uint64_t tsDeltaUs = llabs(il_buffer->nTimeStamp - m_prev_timestampUs);
+            double vsyncUs = 1e6/m_dec_hfr_fps;
+            double vsync_start = (static_cast<uint64_t>(il_buffer->nTimeStamp/vsyncUs)) * vsyncUs;
+            double vsync_end = vsync_start + vsyncUs;
+            bool render_frame = false;
 
-            // Current frame can be send for rendering if
-            // (a) current FPS is <=  60
-            // (b) is the next frame after the frame with TS 0
-            // (c) is the first frame after seek
-            // (d) the delta TS b\w two consecutive frames is > 16 ms
-            // (e) its TS is equal to previous frame TS
-            // (f) if marked EOS
-
-            if(current_framerate <= (OMX_U32)m_dec_hfr_fps || m_last_rendered_TS == 0 ||
-               il_buffer->nTimeStamp == 0 || ts_delta >= (OMX_TICKS)target_ts_delta||
-               ts_delta == 0 || (il_buffer->nFlags & OMX_BUFFERFLAG_EOS)) {
-               m_last_rendered_TS = il_buffer->nTimeStamp;
+            if ((static_cast<double>(il_buffer->nTimeStamp + tsDeltaUs) > (vsync_end + 1.0)) ||
+                 !m_prev_timestampUs || il_buffer->nFlags & OMX_BUFFERFLAG_EOS) {
+                render_frame = true;
+            }
+            // Render frames very close to boundaries of vsync interval
+            if ((abs(static_cast<double>(il_buffer->nTimeStamp) - vsync_start) < 1.0) ||
+                (abs(static_cast<double>(il_buffer->nTimeStamp) - vsync_end) < 1.0)) {
+                render_frame = true;
+            }
+            // Render frames for which ts_Delta == 0, only if previous frame was rendered.
+            if (tsDeltaUs == 0 && m_prev_frame_rendered) {
+                render_frame = true;
+            }
+            if (!render_frame) {
+                buffer->nFilledLen = 0;
+                m_prev_frame_rendered = false;
             } else {
-               //mark for droping
-               buffer->nFilledLen = 0;
+                m_prev_frame_rendered = true;
             }
 
-            DEBUG_PRINT_LOW(" -- %s Frame -- info:: fps(%d) lastRenderTime(%lld) bufferTs(%lld) ts_delta(%lld)",
-                              buffer->nFilledLen? "Rendering":"Dropping",current_framerate,m_last_rendered_TS,
-                              il_buffer->nTimeStamp,ts_delta);
-
-            //above code makes sure that delta b\w two consecutive frames is not
-            //greater than 16ms, slow-mo feature, so cap fps to max 60
-            if (current_framerate > (OMX_U32)m_dec_hfr_fps ) {
-                current_framerate = m_dec_hfr_fps;
-            }
+            m_prev_timestampUs = il_buffer->nTimeStamp;
+            DEBUG_PRINT_LOW(" -- %s Frame with bufferTs(%lld)", buffer->nFilledLen? "Rendering":"Dropping", il_buffer->nTimeStamp);
         }
 
         // add current framerate to gralloc meta data
         if ((buffer->nFilledLen > 0) && m_enable_android_native_buffers && omx_base_address) {
-            // If valid fps was received, directly send it to display for the 1st fbd.
+            // If valid fps was received, consider the same if less than dec hfr rate
             // Otherwise, calculate fps using fbd timestamps
-            float refresh_rate = m_fps_prev;
-            if (m_fps_received) {
-                if (1 == proc_frms) {
-                    refresh_rate = m_fps_received / (float)(1<<16);
-                }
-            } else {
-                // calculate and set refresh rate for every frame from second frame onwards
-                // display will assume the default refresh rate for first frame (which is 60 fps)
-                if (m_fps_prev) {
-                    if (drv_ctx.frame_rate.fps_denominator) {
-                        refresh_rate = drv_ctx.frame_rate.fps_numerator /
-                            (float) drv_ctx.frame_rate.fps_denominator;
-                    }
-                }
-            }
-            OMX_U32 fps_limit = m_dec_hfr_fps ? (OMX_U32)m_dec_hfr_fps : 60;
-            if (refresh_rate > fps_limit) {
-                refresh_rate = fps_limit;
-            }
+            float refresh_rate = (m_fps_received >> 16) ? (m_fps_received >> 16) : current_framerate;
+
+            if (m_dec_hfr_fps)
+                refresh_rate = m_dec_hfr_fps;
+           
             DEBUG_PRINT_LOW("frc set refresh_rate %f, frame %d", refresh_rate, proc_frms);
             OMX_U32 buf_index = buffer - omx_base_address;
             setMetaData((private_handle_t *)native_buffer[buf_index].privatehandle,
                          UPDATE_REFRESH_RATE, (void*)&refresh_rate);
-            m_fps_prev = refresh_rate;
         }
 
         if (buffer->nFilledLen && m_enable_android_native_buffers && omx_base_address) {
@@ -9994,24 +9971,6 @@ void omx_vdec::free_ion_memory(struct vdec_ion *buf_ion_info)
     }
 }
 
-void omx_vdec::do_cache_operations(int fd)
-{
-    if (fd < 0)
-        return;
-
-    struct dma_buf_sync dma_buf_sync_data[2];
-    dma_buf_sync_data[0].flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_RW;
-    dma_buf_sync_data[1].flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_RW;
-
-    for(unsigned int i=0; i<2; i++) {
-        int rc = ioctl(fd, DMA_BUF_IOCTL_SYNC, &dma_buf_sync_data[i]);
-        if (rc < 0) {
-            DEBUG_PRINT_ERROR("Failed DMA_BUF_IOCTL_SYNC %s fd : %d", i==0?"start":"end", fd);
-            return;
-        }
-    }
-}
-
 #endif
 void omx_vdec::free_output_buffer_header(bool intermediate)
 {
@@ -10715,7 +10674,7 @@ void omx_vdec::set_frame_rate(OMX_S64 act_timestamp)
 {
     OMX_U32 new_frame_interval = 0;
     if (VALID_TS(act_timestamp) && VALID_TS(prev_ts) && act_timestamp != prev_ts
-            && llabs(act_timestamp - prev_ts) > 2000) {
+            && (llabs(act_timestamp - prev_ts) > 2000 || frm_int == 0)) {
         new_frame_interval = client_set_fps ? frm_int : (act_timestamp - prev_ts) > 0 ?
             llabs(act_timestamp - prev_ts) : llabs(act_timestamp - prev_ts_actual);
         if (new_frame_interval != frm_int || frm_int == 0) {
@@ -11439,6 +11398,18 @@ bool omx_vdec::handle_extradata(OMX_BUFFERHEADERTYPE *p_buf_hdr)
                             m_extradata_info.output_width = output_crop_payload->width;
                             m_extradata_info.output_height = output_crop_payload->height;
                             m_extradata_info.output_crop_updated = OMX_TRUE;
+#ifdef VENUS_USES_LEGACY_MISR_INFO
+                            DEBUG_PRINT_HIGH("MISR0: %x %x %x %x\n",
+                                output_crop_payload->misr_info[0].misr_dpb_luma,
+                                output_crop_payload->misr_info[0].misr_dpb_chroma,
+                                output_crop_payload->misr_info[0].misr_opb_luma,
+                                output_crop_payload->misr_info[0].misr_opb_chroma);
+                            DEBUG_PRINT_HIGH("MISR1: %x %x %x %x\n",
+                                output_crop_payload->misr_info[1].misr_dpb_luma,
+                                output_crop_payload->misr_info[1].misr_dpb_chroma,
+                                output_crop_payload->misr_info[1].misr_opb_luma,
+                                output_crop_payload->misr_info[1].misr_opb_chroma);
+#else
                             for(unsigned int m=0; m<output_crop_payload->misr_info[0].misr_set; m++) {
                             DEBUG_PRINT_HIGH("MISR0: %x %x %x %x\n",
                                 output_crop_payload->misr_info[0].misr_dpb_luma[m],
@@ -11453,6 +11424,7 @@ bool omx_vdec::handle_extradata(OMX_BUFFERHEADERTYPE *p_buf_hdr)
                                                  output_crop_payload->misr_info[1].misr_opb_luma[m],
                                                  output_crop_payload->misr_info[1].misr_opb_chroma[m]);
                             }
+#endif
                             memcpy(m_extradata_info.misr_info, output_crop_payload->misr_info, 2 * sizeof(msm_vidc_misr_info));
                             if (client_extradata & OMX_OUTPUTCROP_EXTRADATA) {
                                 if (p_client_extra) {
@@ -12005,6 +11977,29 @@ void omx_vdec::print_debug_extradata(OMX_OTHER_EXTRADATATYPE *extra)
             (unsigned int)outputcrop_info->frame_num,
             (unsigned int)outputcrop_info->bit_depth_y,
             (unsigned int)outputcrop_info->bit_depth_c);
+       
+#ifdef VENUS_USES_LEGACY_MISR_INFO
+
+        DEBUG_PRINT_HIGH(
+            "     top field: misr_dpb_luma: %u \n"
+            "   top field: misr_dpb_chroma: %u \n"
+            "     top field: misr_opb_luma: %u \n"
+            "   top field: misr_opb_chroma: %u \n"
+            "  bottom field: misr_dpb_luma: %u \n"
+            "bottom field: misr_dpb_chroma: %u \n"
+            "  bottom field: misr_opb_luma: %u \n"
+            "bottom field: misr_opb_chroma: %u \n",
+            (unsigned int)outputcrop_info->misr_info[0].misr_dpb_luma,
+            (unsigned int)outputcrop_info->misr_info[0].misr_dpb_chroma,
+            (unsigned int)outputcrop_info->misr_info[0].misr_opb_luma,
+            (unsigned int)outputcrop_info->misr_info[0].misr_opb_chroma,
+            (unsigned int)outputcrop_info->misr_info[1].misr_dpb_luma,
+            (unsigned int)outputcrop_info->misr_info[1].misr_dpb_chroma,
+            (unsigned int)outputcrop_info->misr_info[1].misr_opb_luma,
+            (unsigned int)outputcrop_info->misr_info[1].misr_opb_chroma);
+
+#else
+       
         for(unsigned int m=0; m<outputcrop_info->misr_info[0].misr_set; m++) {
             DEBUG_PRINT_HIGH(
             "     top field: misr_dpb_luma(%d): %u \n"
@@ -12027,6 +12022,7 @@ void omx_vdec::print_debug_extradata(OMX_OTHER_EXTRADATATYPE *extra)
             m, (unsigned int)outputcrop_info->misr_info[1].misr_opb_luma[m],
             m, (unsigned int)outputcrop_info->misr_info[1].misr_opb_chroma[m]);
         }
+#endif
         DEBUG_PRINT_HIGH("================== End of output crop ===========");
     } else if (extra->eType == OMX_ExtraDataNone) {
         DEBUG_PRINT_HIGH("========== End of Terminator ===========");
@@ -12691,16 +12687,15 @@ OMX_BUFFERHEADERTYPE* omx_vdec::allocate_color_convert_buf::get_il_buf_hdr
         bool status = false;
         if (!omx->in_reconfig && !omx->output_flush_progress && bufadd->nFilledLen) {
             pthread_mutex_lock(&omx->c_lock);
-            omx->do_cache_operations(omx->drv_ctx.op_intermediate_buf_ion_info[index].data_fd);
 
             DEBUG_PRINT_INFO("C2D: Start color convertion");
+            cache_invalidate(omx->drv_ctx.ptr_outputbuffer[index].pmem_fd);
             status = c2dcc.convertC2D(
                              omx->drv_ctx.ptr_intermediate_outputbuffer[index].pmem_fd,
                              bufadd->pBuffer, bufadd->pBuffer,
                              omx->drv_ctx.ptr_outputbuffer[index].pmem_fd,
                              omx->m_out_mem_ptr[index].pBuffer,
                              omx->m_out_mem_ptr[index].pBuffer);
-            omx->do_cache_operations(omx->drv_ctx.op_intermediate_buf_ion_info[index].data_fd);
             if (!status) {
                 DEBUG_PRINT_ERROR("Failed color conversion %d", status);
                 m_out_mem_ptr_client[index].nFilledLen = 0;
